@@ -1,0 +1,59 @@
+{
+  "listen": "0.0.0.0:8092",
+  "public_model": "qwen3.8-27b",
+  "context_length": 240000,
+  "probe_timeout": 1.0,
+  "probe_interval": 2.0,
+  "request_timeout": 600,
+  "idle_seconds": 600,
+  "start_timeout": 180,
+  "fail_cooldown": 30,
+  "backends": [
+    {
+      "name": "fast-gpu",
+      "origin": "http://fast-gpu.example:8092",
+      "remote": true,
+      "capabilities": ["text", "vision", "image"],
+      "weakness": 0,
+      "slots": 2
+    },
+    {
+      "name": "local-a",
+      "origin": "http://127.0.0.1:8090",
+      "command": ["/opt/ninfer/bin/serve-local-a", "run"],
+      "gpu": "local-a",
+      "weakness": 20,
+      "capabilities": ["text"],
+      "slots": 2
+    },
+    {
+      "name": "local-b",
+      "origin": "http://127.0.0.1:8091",
+      "command": ["/opt/ninfer/bin/serve-local-b", "run"],
+      "gpu": "local-b",
+      "weakness": 30,
+      "capabilities": ["text"],
+      "slots": 1
+    },
+    {
+      "name": "vision-b",
+      "origin": "http://127.0.0.1:8093",
+      "command": ["/opt/ninfer/bin/serve-vision", "run", "local-b"],
+      "preflight": ["/opt/ninfer/bin/serve-vision", "check"],
+      "gpu": "local-b",
+      "weakness": 30,
+      "capabilities": ["vision"],
+      "slots": 1
+    },
+    {
+      "name": "vision-a",
+      "origin": "http://127.0.0.1:8094",
+      "command": ["/opt/ninfer/bin/serve-vision", "run", "local-a"],
+      "preflight": ["/opt/ninfer/bin/serve-vision", "check"],
+      "gpu": "local-a",
+      "weakness": 20,
+      "capabilities": ["vision"],
+      "slots": 1
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "listen": "127.0.0.1:8092",
+  "public_model": "qwen3.8-27b",
+  "context_length": 240000,
+  "probe_timeout": 1.0,
+  "probe_interval": 2.0,
+  "request_timeout": 600,
+  "idle_seconds": 600,
+  "start_timeout": 180,
+  "fail_cooldown": 30,
+  "backends": [
+    {
+      "name": "fast-gpu",
+      "origin": "http://fast-gpu.example:8092",
+      "remote": true,
+      "capabilities": ["text"],
+      "weakness": 0,
+      "slots": 2
+    },
+    {
+      "name": "workstation",
+      "origin": "http://workstation.example:8092",
+      "remote": true,
+      "capabilities": ["text", "vision", "image"],
+      "weakness": 10,
+      "slots": 3
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+#!/bin/bash
+# Local router Hermes talks to. Backends start on demand, in config order,
+# and stop after they are idle.
+#   ninfer-router start|stop|status|run
+set -euo pipefail
+
+HERE="$(dirname "$(readlink -f "$0")")"
+# shellcheck source=engine-common.sh
+source "$HERE/engine-common.sh"
+
+ACTION=${1:-status}
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}/ninfer-router"
+if [[ -n "${NINFER_ROUTER_CONFIG:-}" ]]; then
+  CONFIG=$NINFER_ROUTER_CONFIG
+elif [[ -f "$CONFIG_HOME/router.json" ]]; then
+  CONFIG=$CONFIG_HOME/router.json
+elif [[ -f "$HERE/router.local.json" ]]; then
+  CONFIG=$HERE/router.local.json
+elif [[ -f "$HERE/router.json" ]]; then
+  CONFIG=$HERE/router.json
+else
+  echo "ninfer-router: no router config." >&2
+  echo "Copy examples/router.gpu-host.json to $CONFIG_HOME/router.json" >&2
+  echo "or set NINFER_ROUTER_CONFIG to a JSON file." >&2
+  exit 1
+fi
+PY="${NINFER_ROUTER_PYTHON:-}"
+if [[ -z "$PY" && -x /usr/bin/python3 ]]; then
+  PY=/usr/bin/python3
+fi
+if [[ -z "$PY" ]]; then
+  PY=python3
+fi
+CMD=(
+  "$PY"
+  "$HERE/gpu_router.py"
+  --config "$CONFIG"
+)
+
+case "$ACTION" in
+  run) exec "${CMD[@]}" ;;
+  start)
+    with_lock add_hold router manual
+    systemctl --user start ninfer-router.service
+    wait_http "$ROUTER_URL/health" 30
+    ;;
+  stop) manual_stop router ;;
+  status)
+    show_status router ""
+    curl -fsS --max-time 2 "$ROUTER_URL/health" || echo "router health: not responding"
+    echo
+    ;;
+  *)
+    echo "usage: ninfer-router {start|stop|status|run}" >&2
+    exit 2
+    ;;
+esac

@@ -1,0 +1,19 @@
+[Unit]
+Description=Local model router for Hermes Agent
+After=network.target
+
+[Service]
+Type=simple
+# Clone path used below. Change both lines if the checkout lives elsewhere.
+ExecStart=%h/Local-Model-Router-for-Hermes-Agent/ninfer-router run
+WorkingDirectory=%h/Local-Model-Router-for-Hermes-Agent
+Restart=on-failure
+RestartSec=2
+# The router stops engines it started. KillMode=process leaves a manually
+# held server outside this cgroup. The stop timeout covers a model unload.
+TimeoutStopSec=45
+KillMode=process
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

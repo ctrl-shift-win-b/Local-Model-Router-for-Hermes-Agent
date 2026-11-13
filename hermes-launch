@@ -1,0 +1,44 @@
+#!/bin/bash
+# Start the GPU router for an agent invocation, then run the real Hermes.
+# The router stops when this process exits unless a manual start is holding
+# it. GPUs are not loaded here: the router starts one for a request and
+# unloads it after the idle timeout. A manual engine start keeps that GPU up.
+# Usage: hermes-launch auto|always REAL_HERMES [args...]
+set -euo pipefail
+
+HERE="$(dirname "$(readlink -f "$0")")"
+MODE=${1:?auto or always}
+REAL=${2:?path to hermes}
+shift 2
+
+should=0
+if [[ "$MODE" == "always" ]]; then
+  if [[ " $* " != *" --help "* && " $* " != *" -h "* && " $* " != *" --version "* && " $* " != *" -V "* ]]; then
+    should=1
+  fi
+elif [[ "$MODE" == "auto" ]]; then
+  if "$HERE/hermes_needs_engines.py" "$@"; then
+    should=1
+  fi
+else
+  echo "hermes-launch: mode must be auto or always" >&2
+  exit 2
+fi
+
+if (( should == 0 )); then
+  exec "$REAL" "$@"
+fi
+
+"$HERE/engine-common.sh" acquire "$$"
+cleanup() {
+  "$HERE/engine-common.sh" release "$$" || true
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
+if ! "$HERE/engine-common.sh" wait-ready; then
+  exit 1
+fi
+
+"$REAL" "$@"
