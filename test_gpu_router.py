@@ -26,6 +26,7 @@ from gpu_router import (
     prepare_body,
     probe,
     request_kind,
+    role_of,
     session_of,
 )
 from hermes_needs_engines import needs_engines
@@ -46,7 +47,12 @@ class _Catalog(BaseHTTPRequestHandler):
         body = json.dumps({"data": [{"id": self.model_id}]}).encode()
         self._send(200, body)
 
+    before_post = None
+
     def do_POST(self) -> None:  # noqa: N802
+        hook = type(self).__dict__.get("before_post")
+        if hook is not None:
+            hook()
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length)
         self.seen.append(json.loads(raw.decode()))
@@ -71,13 +77,14 @@ class _Catalog(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def _serve(model_id: str, fail: bool = False) -> tuple[ThreadingHTTPServer, str]:
+def _serve(model_id: str, fail: bool = False, before_post=None) -> tuple[ThreadingHTTPServer, str]:
     class Handler(_Catalog):
         pass
 
     Handler.model_id = model_id
     Handler.fail = fail
     Handler.seen = []
+    Handler.before_post = before_post
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     port = server.server_address[1]
@@ -278,6 +285,31 @@ class RequestKindTests(unittest.TestCase):
             request_kind("POST", "/v1/chat/completions", b'{"messages":[{"content":"hi"}]}', "application/json"),
             "text",
         )
+
+    def test_a_tool_schema_that_names_image_url_stays_text(self) -> None:
+        body = json.dumps({
+            "model": "qwen3.8-27b",
+            "messages": [{"role": "user", "content": "good morning"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "vision_analyze",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"image_url": {"type": "string"}, "question": {"type": "string"}},
+                        "required": ["image_url", "question"],
+                    },
+                },
+            }],
+        }).encode()
+        self.assertEqual(request_kind("POST", "/v1/chat/completions", body, "application/json"), "text")
+        picture = json.dumps({
+            "messages": [{"role": "tool", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aa"}},
+            ]}],
+            "tools": [{"function": {"parameters": {"properties": {"image_url": {"type": "string"}}}}}],
+        }).encode()
+        self.assertEqual(request_kind("POST", "/v1/chat/completions", picture, "application/json"), "vision")
 
 
 class ScopeTests(unittest.TestCase):
@@ -601,6 +633,9 @@ class SessionPinTests(unittest.TestCase):
             "root",
         )
         self.assertEqual(len(session_of({"X-Router-Session": "x" * 500}) or ""), 200)
+        self.assertEqual(role_of({}), "")
+        self.assertEqual(role_of({"X-Router-Role": "main"}), "main")
+        self.assertEqual(role_of({"X-Router-Role": "agent"}), "")
 
     def test_the_session_header_is_forwarded_with_local_scope(self) -> None:
         headers = _forward_headers(
@@ -617,39 +652,72 @@ class SessionPinTests(unittest.TestCase):
         self.assertEqual(headers["X-Router-Scope"], "local")
         self.assertNotIn("Host", headers)
 
-    def test_sessions_pack_onto_free_slots_and_then_stay(self) -> None:
-        first, origin_a = _serve("fast")
+    def test_idle_agents_share_the_fast_card_and_a_busy_card_spreads_them(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+
+        def hold() -> None:
+            started.set()
+            release.wait(5)
+
+        first, origin_a = _serve("fast", before_post=hold)
         second, origin_b = _serve("next")
+        self.addCleanup(release.set)
         self.addCleanup(first.shutdown)
         self.addCleanup(first.server_close)
         self.addCleanup(second.shutdown)
         self.addCleanup(second.server_close)
-        pool = Pool(
-            [
-                Backend("5090", origin_a, slots=1),
-                Backend("3090", origin_b, slots=1),
-            ]
+        router = Router(
+            Pool(
+                [
+                    Backend("5090", origin_a, slots=1),
+                    Backend("3090", origin_b, slots=1),
+                ]
+            ),
+            "qwen3.8-27b",
+            240000,
+            1.0,
+            5.0,
         )
-        router = Router(pool, "qwen3.8-27b", 240000, 1.0, 5.0)
         router.probe_all()
         body = {"model": "qwen3.8-27b"}
-        status, alpha = _post(router, "/v1/chat/completions", body, {"X-Router-Session": "alpha"})
-        self.assertEqual(status, 200)
-        self.assertEqual(alpha["ok"], "fast")
-        status, again = _post(router, "/v1/chat/completions", body, {"X-Router-Session": "alpha"})
-        self.assertEqual(again["ok"], "fast")
-        status, beta = _post(router, "/v1/chat/completions", body, {"X-Router-Session": "beta"})
-        self.assertEqual(beta["ok"], "next")
-        status, still = _post(router, "/v1/chat/completions", body, {"X-Router-Session": "alpha"})
-        self.assertEqual(still["ok"], "fast")
-        status, plain = _post(router, "/v1/chat/completions", body, {})
-        self.assertEqual(plain["ok"], "fast")
-        document = router.health_document()
-        self.assertEqual(document["local_sessions"], 2)
-        sessions = {row["name"]: row["sessions"] for row in document["backends"]}
-        self.assertEqual(sessions, {"5090": 1, "3090": 1})
+        landed: dict[str, dict] = {}
 
-    def test_a_dead_pin_moves_and_does_not_migrate_back(self) -> None:
+        def run_alpha() -> None:
+            _status, payload = _post(router, "/v1/chat/completions", body, {"X-Router-Session": "alpha"})
+            landed["alpha"] = payload
+
+        worker = threading.Thread(target=run_alpha)
+        worker.start()
+        self.assertTrue(started.wait(5))
+        _status, plain = _post(router, "/v1/chat/completions", body, {})
+        self.assertEqual(plain["ok"], "next")
+        _status, beta = _post(
+            router,
+            "/v1/chat/completions",
+            body,
+            {"X-Router-Session": "beta", "X-Router-Role": "agent"},
+        )
+        self.assertEqual(beta["ok"], "next")
+        release.set()
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(landed["alpha"]["ok"], "fast")
+        # The fast card is free again, so the agent that spilled promotes.
+        _status, promoted = _post(router, "/v1/chat/completions", body, {"X-Router-Session": "beta"})
+        self.assertEqual(promoted["ok"], "fast")
+        _status, stayed = _post(
+            router,
+            "/v1/chat/completions",
+            body,
+            {"X-Router-Session": "alpha", "X-Router-Role": "main"},
+        )
+        self.assertEqual(stayed["ok"], "fast")
+        pins = {row["name"]: row["pins"] for row in router.health_document()["backends"]}
+        self.assertEqual(pins, {"5090": 2, "3090": 0})
+        self.assertEqual(router.health_document()["local_sessions"], 0)
+
+    def test_a_dead_pin_moves_and_returns_when_the_faster_card_is_back(self) -> None:
         first, origin_a = _serve("fast")
         second, origin_b = _serve("next")
         self.addCleanup(first.shutdown)
@@ -672,8 +740,8 @@ class SessionPinTests(unittest.TestCase):
         self.assertEqual(moved["ok"], "next")
         first.RequestHandlerClass.fail = False
         router.probe_all()
-        _status, stayed = _post(router, "/v1/chat/completions", body, {"X-Router-Session": "alpha"})
-        self.assertEqual(stayed["ok"], "next")
+        _status, returned = _post(router, "/v1/chat/completions", body, {"X-Router-Session": "alpha"})
+        self.assertEqual(returned["ok"], "fast")
 
     def test_the_hermes_header_is_only_a_fallback(self) -> None:
         first, origin_a = _serve("fast")
@@ -692,8 +760,9 @@ class SessionPinTests(unittest.TestCase):
         router.probe_all()
         body = {"model": "qwen3.8-27b"}
         _post(router, "/v1/chat/completions", body, {"X-Router-Session": "alpha"})
+        # An idle pin does not reserve the fast card, so the next agent uses it too.
         _status, beta = _post(router, "/v1/chat/completions", body, {"X-Hermes-Session-Id": "beta"})
-        self.assertEqual(beta["ok"], "next")
+        self.assertEqual(beta["ok"], "fast")
         _status, mixed = _post(
             router,
             "/v1/chat/completions",
@@ -715,10 +784,11 @@ class SessionPinTests(unittest.TestCase):
             idle_seconds=0.05,
         )
         _post(retiring, "/v1/chat/completions", {"model": "qwen3.8-27b"}, {"X-Router-Session": "alpha"})
-        self.assertEqual(retiring.health_document()["local_sessions"], 1)
+        self.assertEqual(retiring.affinity.count("5090", "text"), 1)
+        self.assertEqual(retiring.health_document()["local_sessions"], 0)
         time.sleep(0.08)
         retiring.affinity.reap()
-        self.assertEqual(retiring.health_document()["local_sessions"], 0)
+        self.assertEqual(retiring.affinity.count("5090", "text"), 0)
         kept = Router(
             Pool([Backend("5090", origin, slots=1)]),
             "qwen3.8-27b",
@@ -730,7 +800,7 @@ class SessionPinTests(unittest.TestCase):
         _post(kept, "/v1/chat/completions", {"model": "qwen3.8-27b"}, {"X-Router-Session": "alpha"})
         time.sleep(0.05)
         kept.affinity.reap()
-        self.assertEqual(kept.health_document()["local_sessions"], 1)
+        self.assertEqual(kept.affinity.count("5090", "text"), 1)
 
     def test_discovery_does_not_create_a_pin(self) -> None:
         server, origin = _serve("fast")
@@ -808,7 +878,54 @@ class SessionPinTests(unittest.TestCase):
         self.assertTrue(held.pool.health_of("5090").up)
         self.assertEqual(held.pool.health_of("5090").sessions, 0)
         held.note("alpha", "text", "5090")
+        # A quiet pin is not occupancy. A live request on that card is.
+        self.assertEqual(held.place("text", False, "beta")[0].name, "5090")
+        claimed = held.claim(held.place("text", False, "alpha"), "text")
+        self.assertIsNotNone(claimed)
+        assert claimed is not None
+        self.assertEqual(claimed.name, "5090")
         self.assertEqual(held.place("text", False, "beta")[0].name, "3090")
+        held.release_slot(claimed, "text")
+        self.assertEqual(held.place("text", False, "beta")[0].name, "5090")
+
+    def test_a_slower_pin_promotes_only_while_the_faster_card_has_room(self) -> None:
+        router = Router(
+            Pool(
+                [
+                    Backend("5090", "http://127.0.0.1:9", slots=1),
+                    Backend("3090", "http://127.0.0.1:9", slots=1),
+                ]
+            ),
+            "qwen3.8-27b",
+            240000,
+            0.2,
+            1.0,
+        )
+        router.note("alpha", "text", "3090")
+        self.assertEqual(router.place("text", False, "alpha")[0].name, "5090")
+        claimed = router.claim(router.place("text", False, "other"), "text")
+        self.assertIsNotNone(claimed)
+        assert claimed is not None
+        self.assertEqual(claimed.name, "5090")
+        self.assertEqual(router.place("text", False, "alpha")[0].name, "3090")
+        router.release_slot(claimed, "text")
+        self.assertEqual(router.place("text", False, "alpha")[0].name, "5090")
+
+    def test_a_vision_pin_does_not_promote(self) -> None:
+        router = Router(
+            Pool(
+                [
+                    Backend("vision-v100", "http://127.0.0.1:9", slots=1, capabilities=("vision",), weakness=30),
+                    Backend("vision-3090", "http://127.0.0.1:9", slots=1, capabilities=("vision",), weakness=20),
+                ]
+            ),
+            "qwen3.8-27b",
+            240000,
+            0.2,
+            1.0,
+        )
+        router.note("alpha", "vision", "vision-3090")
+        self.assertEqual(router.place("vision", False, "alpha")[0].name, "vision-3090")
 
     def test_vision_pins_do_not_consume_text_slots(self) -> None:
         router = Router(

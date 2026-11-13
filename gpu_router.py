@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """OpenAI-compatible router for the local Qwen servers Hermes is allowed to use.
 
-Text preference is the order of the backends in the config: the 5090 router,
-then the 3090, then the V100. A remote backend that failed its last probe is
+Text preference is the order of the backends in the config, fastest first.
+A remote backend that failed its last probe is
 skipped, so a dead machine does not add a connect timeout. Managed backends
 stay eligible when they are down, because a request is allowed to start them.
 
@@ -11,9 +11,9 @@ stopped after it has had no requests for ``idle_seconds`` (default 10 minutes).
 The router only kills processes it started. A manual hold under the state
 directory keeps that server up.
 
-Requests that carry an image or a video use a vision backend instead of the
-text model. The weakest free GPU is unloaded first (the V100, then the 3090,
-then a remote machine). If every candidate is busy, held, or missing its
+Requests whose messages contain an image or a video use a vision backend
+instead of the text model. A tool parameter named image_url is not an image.
+The weakest free GPU is unloaded first. If every candidate is busy, held, or missing its
 weights, the router returns a 503 Hermes can show, and it says to try again
 later. Image generation is a separate capability and gets its own error when
 no image engine is configured.
@@ -21,13 +21,15 @@ no image engine is configured.
 Cross-machine calls send ``X-Router-Scope: local``. The far router then uses
 only its own GPUs, so the two routers cannot bounce one request forever.
 
-A client may name a conversation with ``X-Router-Session``. That key stays on
-the backend that first accepted it until the key has been quiet for
-``idle_seconds``. A new key takes the first eligible backend that has a free
-slot (``slots`` in the config; 0 means unlimited). A request with no session
-header keeps the plain preference order and does not take a slot. If the
-pinned backend is down, the key moves to whichever backend actually answers.
-Retiring a pin does not unload a process; the process idle timer still does.
+A client names one agent with ``X-Router-Session``. Text placement is
+sticky until a faster card has a free in-flight slot: the agent stays put
+while its card is up and every faster card is busy, and the next request
+moves when a faster card is free. A running generation is not cancelled.
+``slots`` counts requests in flight (0 means unlimited), not idle agents, so
+a quiet pin does not block a free card. Vision keeps its pin. A request
+with no session header is not pinned. If the chosen backend fails the
+request, the key moves to whichever backend answers. Retiring a pin does
+not unload a process; the process idle timer still does.
 """
 
 from __future__ import annotations
@@ -53,6 +55,7 @@ VISION_MODEL = "qwen3.5-2b"
 VISION_CONTEXT = 8192
 SCOPE_HEADER = "X-Router-Scope"
 SESSION_HEADER = "X-Router-Session"
+ROLE_HEADER = "X-Router-Role"
 _FALLBACK_SESSION_HEADER = "X-Hermes-Session-Id"
 _SESSION_LIMIT = 200
 _HOP_BY_HOP = {
@@ -64,8 +67,8 @@ _HOP_BY_HOP = {
     "te",
     "trailer",
 }
-# The V100 server rejects minimal, high, and max. The 3090 folds those onto
-# the same three template rungs itself, so only the V100 needs this rewrite.
+# A backend named exactly "v100" rejects minimal, high, and max. Other
+# backends receive reasoning_effort unchanged, so only that name is rewritten.
 _V100_EFFORT = {"minimal": "low", "high": "xhigh", "max": "xhigh"}
 _VISUAL_INPUTS = {
     "image_url",
@@ -187,7 +190,7 @@ def probe(backend: Backend, timeout: float) -> Health:
     """GET /v1/models. A non-200 or a transport error marks the backend down.
 
     A remote router that answered the model list also reports how many text
-    sessions it has pinned to its own GPUs. A failed ``/health`` read leaves
+    requests are in flight on its own GPUs. A failed ``/health`` read leaves
     that count at 0 and does not mark the backend down.
     """
     try:
@@ -272,8 +275,9 @@ def prepare_body(
 def request_kind(method: str, path: str, body: bytes, content_type: str) -> str:
     """Classify a proxied call as text, vision, or image generation.
 
-    Vision is an image or video inside the request. Image generation is a
-    request that asks for a picture back, including ``/v1/images``.
+    Vision is an image or video inside a message. Tool schemas are not
+    pictures: Hermes names ``image_url`` on ``vision_analyze`` for every
+    turn. Image generation asks for a picture back, including ``/v1/images``.
     """
     del method, content_type
     route = urlsplit(path).path
@@ -300,16 +304,45 @@ def _wants_image_output(payload: dict) -> bool:
     return False
 
 
+def _part_is_visual(part: object) -> bool:
+    """True when one content part carries an image or a video."""
+    if not isinstance(part, dict):
+        return False
+    kind = part.get("type")
+    if isinstance(kind, str) and kind.lower() in _VISUAL_INPUTS:
+        return True
+    return any(key in part for key in ("image_url", "input_image", "video_url"))
+
+
+def _content_is_visual(content: object) -> bool:
+    if isinstance(content, list):
+        return any(_part_is_visual(part) for part in content)
+    return _part_is_visual(content)
+
+
 def _has_visual_input(value: object) -> bool:
-    if isinstance(value, dict):
-        kind = value.get("type")
-        if isinstance(kind, str) and kind.lower() in _VISUAL_INPUTS:
-            return True
-        if any(key in value for key in ("image_url", "input_image", "video_url")):
-            return True
-        return any(_has_visual_input(item) for item in value.values())
-    if isinstance(value, list):
-        return any(_has_visual_input(item) for item in value)
+    """True when a chat message contains an image or a video.
+
+    The scan stays on message content. Walking the whole body treats the
+    ``vision_analyze`` tool schema, whose parameter is named ``image_url``,
+    as a picture and sends an ordinary turn to the small vision model.
+    """
+    if not isinstance(value, dict):
+        return False
+    messages = value.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if isinstance(message, dict) and _content_is_visual(message.get("content")):
+                return True
+    incoming = value.get("input")
+    if isinstance(incoming, list):
+        for item in incoming:
+            if _part_is_visual(item) or (
+                isinstance(item, dict) and _content_is_visual(item.get("content"))
+            ):
+                return True
+    elif _part_is_visual(incoming):
+        return True
     return False
 
 
@@ -724,17 +757,20 @@ def _open(
 
 
 class Affinity:
-    """Conversation key to backend. The key is opaque; the router does not read prompts.
+    """Agent key to backend. The key is opaque; the router does not read prompts.
 
     A pin retires after ``idle_seconds`` with no successful request for that
     key and kind. Zero disables retirement. Text and vision pins are separate,
-    so a vision call does not consume a text slot.
+    so a vision call does not consume a text slot. In-flight counts are
+    separate from pins: a quiet agent keeps its preference and does not occupy
+    a concurrency slot.
     """
 
     def __init__(self, idle_seconds: float) -> None:
         self.idle_seconds = idle_seconds
         self._lock = threading.Lock()
         self._pins: dict[tuple[str, str], tuple[str, float]] = {}
+        self._inflight: dict[tuple[str, str], int] = {}
 
     def reap(self) -> None:
         if self.idle_seconds <= 0:
@@ -779,6 +815,32 @@ class Affinity:
                 for (_session, kind), (name, _used) in self._pins.items()
                 if kind == "text" and name in names
             )
+
+    def inflight(self, backend: str, kind: str) -> int:
+        with self._lock:
+            return self._inflight.get((backend, kind), 0)
+
+    def local_text_inflight(self, names: set[str]) -> int:
+        with self._lock:
+            return sum(
+                count
+                for (name, kind), count in self._inflight.items()
+                if kind == "text" and name in names
+            )
+
+    def acquire(self, backend: str, kind: str) -> None:
+        with self._lock:
+            key = (backend, kind)
+            self._inflight[key] = self._inflight.get(key, 0) + 1
+
+    def release(self, backend: str, kind: str) -> None:
+        with self._lock:
+            key = (backend, kind)
+            current = self._inflight.get(key, 0)
+            if current <= 1:
+                self._inflight.pop(key, None)
+            else:
+                self._inflight[key] = current - 1
 
 
 class Router:
@@ -828,34 +890,104 @@ class Router:
         return sorted(rows, key=key)
 
     def _occupied(self, backend: Backend, kind: str) -> int:
-        local = self.affinity.count(backend.name, kind)
+        local = self.affinity.inflight(backend.name, kind)
         if not backend.remote:
             return local
         reported = self.pool.health_of(backend.name).sessions
         return local if local > reported else reported
 
+    def _free(self, backend: Backend, kind: str) -> bool:
+        if backend.slots <= 0:
+            return True
+        return self._occupied(backend, kind) < backend.slots
+
     def place(self, kind: str, local_only: bool, session: str | None) -> list[Backend]:
         """Order backends for one request.
 
-        An existing pin stays first while that backend is still a candidate.
-        A new key takes the first candidate with a free slot. No session key
-        keeps the plain preference order; the caller must not record a pin.
+        Text is sticky until a faster candidate has a free in-flight slot.
+        Config order is the speed order, fastest first. An idle pin does not
+        consume a slot. Vision does not promote: a vision pin stays first.
+        No session key is not pinned; a text request still prefers a card
+        that has room. The caller records a pin only after a session key
+        is actually served.
         """
         self.affinity.reap()
         rows = self.ordered(kind, local_only)
-        if not session or not rows:
+        if not rows:
             return rows
-        pinned = self.affinity.get(session, kind)
-        if pinned:
+        if kind != "text":
+            if not session:
+                return rows
+            pinned = self.affinity.get(session, kind)
+            if pinned:
+                for backend in rows:
+                    if backend.name == pinned:
+                        return [backend, *[item for item in rows if item.name != pinned]]
+            return rows
+        if not session:
+            free = [backend for backend in rows if self._free(backend, kind)]
+            busy = [backend for backend in rows if backend not in free]
+            return free + busy
+        pinned_name = self.affinity.get(session, kind)
+        chosen: Backend | None = None
+        if pinned_name:
+            # Walk fastest-first. A free card before the pin is a promotion.
+            # Reaching the pin means nothing faster was free.
             for backend in rows:
-                if backend.name == pinned:
-                    return [backend, *[item for item in rows if item.name != pinned]]
-        chosen = rows[0]
-        for backend in rows:
-            if backend.slots <= 0 or self._occupied(backend, kind) < backend.slots:
-                chosen = backend
-                break
-        return [chosen, *[item for item in rows if item.name != chosen.name]]
+                if backend.name == pinned_name:
+                    if self._free(backend, kind):
+                        chosen = backend
+                    break
+                if self._free(backend, kind):
+                    chosen = backend
+                    break
+        if chosen is None:
+            for backend in rows:
+                if self._free(backend, kind):
+                    chosen = backend
+                    break
+        if chosen is None:
+            chosen = rows[0]
+        rest = [backend for backend in rows if backend.name != chosen.name]
+        free_rest = [backend for backend in rest if self._free(backend, kind)]
+        busy_rest = [backend for backend in rest if backend not in free_rest]
+        return [chosen, *free_rest, *busy_rest]
+
+    def claim(self, candidates: list[Backend], kind: str) -> Backend | None:
+        """Reserve one in-flight slot, preferring the first candidate with room.
+
+        Every candidate being full still reserves the first one, so a healthy
+        engine can queue inside its own concurrency limit. The caller releases
+        the reservation when the response finishes, including on failover.
+        """
+        if not candidates:
+            return None
+        reported = {
+            backend.name: self.pool.health_of(backend.name).sessions
+            for backend in candidates
+            if backend.remote
+        }
+        with self.affinity._lock:
+            def used(backend: Backend) -> int:
+                local = self.affinity._inflight.get((backend.name, kind), 0)
+                if not backend.remote:
+                    return local
+                remote = reported.get(backend.name, 0)
+                return local if local > remote else remote
+
+            pick = None
+            for backend in candidates:
+                if backend.slots <= 0 or used(backend) < backend.slots:
+                    pick = backend
+                    break
+            if pick is None:
+                pick = candidates[0]
+            key = (pick.name, kind)
+            self.affinity._inflight[key] = self.affinity._inflight.get(key, 0) + 1
+            return pick
+
+    def release_slot(self, backend: Backend, kind: str) -> None:
+        self.affinity.release(backend.name, kind)
 
     def note(self, session: str | None, kind: str, backend: str) -> None:
         self.affinity.note(session, kind, backend)
@@ -896,14 +1028,15 @@ class Router:
                     "gpu": backend.gpu,
                     "models": list(health.models),
                     "error": health.error,
-                    "sessions": self.affinity.count(backend.name, "text"),
+                    "sessions": self.affinity.inflight(backend.name, "text"),
+                    "pins": self.affinity.count(backend.name, "text"),
                     "slots": backend.slots,
                 }
             )
         return {
             "active": active,
             "public_model": self.public_model,
-            "local_sessions": self.affinity.local_text_sessions(local_names),
+            "local_sessions": self.affinity.local_text_inflight(local_names),
             "backends": rows,
         }
 
@@ -952,6 +1085,18 @@ def session_of(headers: Mapping[str, str]) -> str | None:
     if not cleaned:
         return None
     return cleaned[:_SESSION_LIMIT]
+
+
+def role_of(headers: Mapping[str, str]) -> str:
+    """``main`` when the client says this call is the primary agent, else empty.
+
+    The role is logged. It does not cancel another agent's generation.
+    """
+    raw = headers.get(ROLE_HEADER)
+    if raw is None:
+        return ""
+    text = str(raw).strip().lower()
+    return "main" if text == "main" else ""
 
 
 def _forward_headers(source: Mapping[str, str], body: bytes | None, remote: bool) -> dict[str, str]:
@@ -1037,8 +1182,7 @@ def _unavailable(
             )
         message = (
             "Vision is not available right now. Reading an image unloads the text "
-            "model on the weakest free GPU and loads Qwen3.5-2B there "
-            "(V100, then the RTX 3090, then the 5090). "
+            "model on the weakest free GPU and loads Qwen3.5-2B there. "
             f"{reason} Try again later."
         )
         error_type = "vision_unavailable"
@@ -1099,6 +1243,7 @@ class RouterHandler(BaseHTTPRequestHandler):
         kind = request_kind(self.command, self.path, body, content_type)
         local_only = (self.headers.get(SCOPE_HEADER) or "").strip().lower() == "local"
         session = session_of(self.headers)
+        role = role_of(self.headers)
         candidates = self.router.place(kind, local_only, session)
         busy: list[str] = []
         failed: list[str] = []
@@ -1106,24 +1251,32 @@ class RouterHandler(BaseHTTPRequestHandler):
         if not candidates:
             self._write_json(*_unavailable(kind, busy, failed, last_error))
             return
-        for backend in candidates:
+        # claim() may skip a full card. Drop the one we tried so a failure
+        # cannot select it again. The slot is held until this response ends,
+        # which is the whole generation for a streaming body.
+        remaining = list(candidates)
+        while remaining:
+            backend = self.router.claim(remaining, kind)
+            if backend is None:
+                break
+            remaining = [item for item in remaining if item.name != backend.name]
             leased = False
-            try:
-                leased = self.router.activate(backend)
-            except GpuBusy as exc:
-                busy.append(exc.message)
-                continue
-            except StartFailed as exc:
-                failed.append(exc.message)
-                if exc.permanent:
-                    break
-                continue
-            outgoing = prepare_body(
-                backend.name, body, content_type, self.router.pool.models_of(backend.name)
-            )
-            headers = _forward_headers(self.headers, outgoing if outgoing else None, backend.remote)
             sent = False
             try:
+                try:
+                    leased = self.router.activate(backend)
+                except GpuBusy as exc:
+                    busy.append(exc.message)
+                    continue
+                except StartFailed as exc:
+                    failed.append(exc.message)
+                    if exc.permanent:
+                        break
+                    continue
+                outgoing = prepare_body(
+                    backend.name, body, content_type, self.router.pool.models_of(backend.name)
+                )
+                headers = _forward_headers(self.headers, outgoing if outgoing else None, backend.remote)
                 try:
                     status, response_headers, response = _open(
                         backend,
@@ -1147,13 +1300,15 @@ class RouterHandler(BaseHTTPRequestHandler):
                     last_error = f"{backend.name}: HTTP {status}"
                     continue
                 sys.stderr.write(
-                    f"route {self.command} {urlsplit(self.path).path} -> {backend.name} {status}\n"
+                    f"route {self.command} {urlsplit(self.path).path} -> {backend.name} {status}"
+                    f" session={session or '-'} role={role or '-'}\n"
                 )
                 self.router.note(session, kind, backend.name)
                 _send_upstream(self, status, response_headers, response)
                 sent = True
                 return
             finally:
+                self.router.release_slot(backend, kind)
                 if leased:
                     self.router.release(backend, failed=not sent)
         self._write_json(*_unavailable(kind, busy, failed, last_error))
@@ -1213,7 +1368,7 @@ def load_router_config(path: Path) -> dict:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Route Hermes to the 5090, 3090, or V100")
+    parser = argparse.ArgumentParser(description="Route Hermes to local OpenAI-compatible backends")
     parser.add_argument("--config", help="JSON file describing backends, idle time, and the listen address")
     parser.add_argument("--listen", default="127.0.0.1:8092")
     parser.add_argument("--public-model", default=PUBLIC_MODEL)

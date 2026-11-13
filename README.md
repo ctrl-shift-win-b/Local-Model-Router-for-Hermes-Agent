@@ -9,6 +9,11 @@ This repository is the router only. It does not include model weights or
 an inference engine. A backend is any server that speaks
 `/v1/chat/completions` and `/v1/models`.
 
+A new Hermes client is [docs/new-hermes-client.md](docs/new-hermes-client.md).
+Measured engine choices and how they connect to Hermes are
+[docs/engines-and-results.md](docs/engines-and-results.md). Hostnames and
+addresses stay in the untracked router file, not in this repository.
+
 ## Requirements
 
 - Python 3.10 or newer
@@ -43,11 +48,13 @@ GPU: it listens on `127.0.0.1` and forwards to the other routers.
 Those last two names are gitignored. Keep hostnames, addresses, and start
 commands there, not in the repository.
 
-Backends are tried in the order they appear. A remote backend that failed
-its last probe is skipped. A managed backend (one with a `command`) can be
-down; the request is allowed to start it. `slots` is how many conversations
-may sit on that backend. `0` means unlimited. `weakness` is used when a
-vision request has to choose which local GPU to unload. Higher means weaker.
+Backends are tried in the order they appear. For text, that order is the
+speed order: fastest first. A remote backend that failed its last probe is
+skipped. A managed backend (one with a `command`) can be down; the request
+is allowed to start it. `slots` is how many text requests may run on that
+backend at once. `0` means unlimited. An idle agent does not occupy a slot.
+`weakness` is used when a vision request has to choose which local GPU to
+unload. Higher means weaker.
 
 Set `idle_seconds` to `600` for ten minutes with no request, then unload.
 `0` leaves a started engine running. Discovery calls such as `GET /v1/props`
@@ -56,28 +63,52 @@ do not start an engine and do not reset the idle timer.
 A forwarded call sends `X-Router-Scope: local`. The far router then uses
 only its own backends, so two routers cannot bounce one request forever.
 
-## Conversation pin
+## Placement
 
-Hermes can name a conversation. On the custom provider that points at this
-router:
+Hermes names an agent on the custom provider that points at this router:
 
 ```bash
 hermes config set providers.<your-provider>.session_affinity_header X-Router-Session
 ```
 
-Hermes sends the conversation-root key on each model call. Sub-agents and
-auxiliary calls for that conversation share the key. The router keeps the
-key on the backend that accepted it until the key has been quiet for
-`idle_seconds`. A new key takes the first eligible backend that still has
-a free slot and stays there. The pin moves only when that backend fails
-the request.
+Stock Hermes puts the conversation root in that header, so the main agent
+and its delegates share one backend. A turn on this cluster publishes a
+different key for each delegate (its subagent id) and keeps the main agent
+on the stock key. Auxiliary calls during the turn, such as titles and
+compression, inherit the caller's key. The same turn sends `X-Router-Role:
+main` or `X-Router-Role: agent`. The role is recorded. It does not cancel
+a generation that is already running.
 
-A request with no session header follows the plain preference order and
-does not take a slot. `X-Hermes-Session-Id` is accepted only when
+Text placement is sticky until a faster card is free:
+
+- A new agent takes the fastest backend with a free in-flight slot.
+- It stays there while that backend is up and every faster backend is full.
+- When a faster backend has a free slot, the next request moves. One prefix
+  rebuild, then it sticks to the new card.
+- A request already streaming on a card runs to completion. The next request
+  from that agent is the one that can move.
+- If the pinned card is down or returns 502, 503, or 504, the agent moves
+  to whichever backend answers. It comes back when the faster card is
+  healthy and has room.
+
+`slots` is concurrency, not a reservation. Two sequential agents both use
+the fastest card. Two agents at the same time use two cards when the first
+card's slots are full.
+
+Vision does not promote. A vision pin stays on the GPU that loaded it.
+Only an image or a video inside a message is a vision request. A tool
+schema that names `image_url` stays on the text model.
+A request with no session header is not pinned; text still prefers a card
+that has room. `X-Hermes-Session-Id` is accepted only when
 `X-Router-Session` is absent.
+
+`/health` field `sessions` is in-flight text requests. `pins` is the idle
+preference count. `local_sessions` is the in-flight count on this machine's
+own backends, which is what a peer router reads.
 
 The process idle timer is separate. Retiring a pin does not unload an
 engine. The engine stops when it has had no requests for `idle_seconds`.
+A live pin still blocks unloading that GPU to make room for vision.
 
 ## Run
 

@@ -3,8 +3,8 @@
 # Hermes holds only the router. The router starts a GPU for a request and
 # stops it after the idle timeout. A manual `start` holds that engine so the
 # router will not idle-stop it or unload it for another model. An explicit
-# `stop` clears the hold and stops the process. The 5090 text server is not
-# a unit on this PC: its router runs on the other machine.
+# `stop` clears the hold and stops the process. A remote text server is not
+# a unit here: the router on that machine starts it.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
@@ -12,7 +12,7 @@ STATE="${XDG_STATE_HOME:-$HOME/.local/state}/hermes-gpus"
 HOLD="$STATE/holds"
 LOCK="$STATE/lock"
 ROUTER_URL="${NINFER_ROUTER_URL:-http://127.0.0.1:8092}"
-# Hermes starts the router only. The 3090 and V100 stay unloaded until a
+# Hermes starts the router only. Managed engines stay unloaded until a
 # request needs them. Manual start/stop of those engines still uses their names.
 ROUTER_UNIT=ninfer-router.service
 ACQUIRE_NAMES=(router)

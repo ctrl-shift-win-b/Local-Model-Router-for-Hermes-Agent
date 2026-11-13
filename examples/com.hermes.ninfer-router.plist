@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.hermes.ninfer-router</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>REPLACE_HOME/Local-Model-Router-for-Hermes-Agent/ninfer-router</string>
+		<string>run</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>REPLACE_HOME/Local-Model-Router-for-Hermes-Agent</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>REPLACE_HOME</string>
+		<key>NINFER_ROUTER_PYTHON</key>
+		<string>REPLACE_HOME/.hermes/tools/python-3.14-darwin-arm64/bin/python3</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>REPLACE_HOME/Library/Logs/ninfer-router.log</string>
+	<key>StandardErrorPath</key>
+	<string>REPLACE_HOME/Library/Logs/ninfer-router.log</string>
+</dict>
+</plist>
