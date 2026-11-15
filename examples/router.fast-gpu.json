@@ -8,6 +8,10 @@
   "idle_seconds": 600,
   "start_timeout": 180,
   "fail_cooldown": 30,
+  "registry": {
+    "server": "http://directory.example:8096",
+    "interval_seconds": 30
+  },
   "backends": [
     {
       "name": "fast-gpu",
@@ -22,6 +26,7 @@
       "name": "workstation",
       "origin": "http://workstation.example:8092",
       "remote": true,
+      "machine_id": "id-from-that-machine",
       "capabilities": ["text", "vision", "image"],
       "weakness": 0,
       "slots": 3

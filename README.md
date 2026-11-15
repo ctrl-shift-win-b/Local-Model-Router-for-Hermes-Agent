@@ -81,7 +81,7 @@ a generation that is already running.
 
 Text placement is sticky until a faster card is free:
 
-- A new agent takes the fastest backend with a free in-flight slot.
+- A new agent takes the fastest backend with a free agent slot.
 - It stays there while that backend is up and every faster backend is full.
 - When a faster backend has a free slot, the next request moves. One prefix
   rebuild, then it sticks to the new card.
@@ -91,9 +91,11 @@ Text placement is sticky until a faster card is free:
   to whichever backend answers. It comes back when the faster card is
   healthy and has room.
 
-`slots` is concurrency, not a reservation. Two sequential agents both use
-the fastest card. Two agents at the same time use two cards when the first
-card's slots are full.
+`slots` is how many agents may keep that card. Two agents fill a card with
+two slots, and the next agent takes the next card, including while the
+earlier agents are between calls. A call in flight also takes a slot, so a
+burst of new agents spreads before their pins are recorded. An agent already
+assigned to a card still fits on it when that card is full.
 
 Vision does not promote. A vision pin stays on the GPU that loaded it.
 Only an image or a video inside a message is a vision request. A tool
@@ -102,13 +104,59 @@ A request with no session header is not pinned; text still prefers a card
 that has room. `X-Hermes-Session-Id` is accepted only when
 `X-Router-Session` is absent.
 
-`/health` field `sessions` is in-flight text requests. `pins` is the idle
-preference count. `local_sessions` is the in-flight count on this machine's
-own backends, which is what a peer router reads.
+`/health` field `sessions` is in-flight text requests. `pins` is how many
+agents are assigned to that backend. `local_sessions` is the in-flight count
+on this machine's own backends, which is what a peer router reads.
 
 The process idle timer is separate. Retiring a pin does not unload an
 engine. The engine stops when it has had no requests for `idle_seconds`.
 A live pin still blocks unloading that GPU to make room for vision.
+
+## Address directory
+
+Wi-Fi addresses change. `registry_server.py` is a separate process that
+stores the address each router last connected from. It does not route a
+request and it does not start a model.
+
+A router with `registry.server` set POSTs its machine id and listen port
+on `registry.interval_seconds` (default 30). The directory stores the TCP
+peer address when that host answers `GET /health`. The same machine id
+replaces the stored address. A new id is added. A path that rewrites the
+source presents a gateway instead of the router. The directory then keeps
+the listen address the router sends, after that address answers. A router
+does not move a backend onto an address that does not answer. Every
+interval the directory reads `GET /health` on each stored address. A
+member with no successful register and no successful health check for
+300 seconds is removed. The next POST adds it again.
+
+A router that listens on loopback stays listed by registering again on
+each interval. Leave that machine out of every backend list. A backend
+with `machine_id` follows that member's current address. A backend with
+no `machine_id` keeps the origin in the config. The running process keeps
+the new address in memory, and `router.json` stays as written. A request
+already in flight keeps the address it started with.
+
+```bash
+mkdir -p "${XDG_STATE_HOME:-$HOME/.local/state}/router-registry"
+python3 registry_server.py --listen 0.0.0.0:8096 \
+  --state "${XDG_STATE_HOME:-$HOME/.local/state}/router-registry/members.json"
+```
+
+`members.json` and `machine-id` hold the addresses the directory last
+learned. `router.json` holds the hosts you filled in. All three are
+gitignored. Commit the examples, not a filled-in config.
+
+`systemd/router-registry.service` is a user unit, same as the router.
+Install it when the checkout is at `~/Local-Model-Router-for-Hermes-Agent`.
+Point a router at the directory with:
+
+```json
+"registry": {"server": "http://directory.example:8096", "interval_seconds": 30}
+```
+
+On a remote backend that should follow one machine, set `machine_id` to
+the contents of that machine's `machine-id` file. The file is created
+under the router state directory the first time the registry is enabled.
 
 ## Run
 
@@ -134,7 +182,7 @@ systemctl --user enable --now ninfer-router.service
 ## Tests
 
 ```bash
-python3 -m unittest test_gpu_router
+python3 -m unittest test_gpu_router test_registry_server
 ```
 
 The tests use in-process HTTP servers. They do not start a GPU.

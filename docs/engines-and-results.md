@@ -174,21 +174,24 @@ Placement:
 
 - Each Hermes agent has its own `X-Router-Session` key. Auxiliary calls
   use the caller's key. `X-Router-Role` is logged and does not move work.
-- A new agent takes the fastest backend with a free in-flight slot and
-  stays while that card is up and every faster card is full. The next
-  request moves when a faster card has room.
+- A new agent takes the fastest backend with a free agent slot and stays
+  while that card is up and every faster card is full. The next request
+  moves when a faster card has room.
 - A generation that is already streaming is never cancelled.
 - A dead backend fails over. The agent returns when the faster card is
   healthy and has room.
-- Slots count in-flight requests. An idle pin does not occupy a slot.
-  The text cap is 5.
+- Slots are agent assignments. An idle agent keeps its card. A call in
+  flight also takes a slot. The text cap is 5: two, two, and one.
 - Headerless posts are not pinned. Text still prefers a card with room.
 - Vision does not promote.
 - A live pin blocks vision from unloading that GPU.
 - Process unload is a separate 600 second clock.
 - A forwarded call sends `X-Router-Scope: local`.
 - Routers do not share pins. Occupancy of a remote backend is the max of
-  this router's forwards and the peer's `local_sessions`.
+  this router's other assigned agents, its in-flight forwards, and the
+  peer's `local_sessions`.
+- With `registry.server` set, a router registers with that directory and
+  follows `machine_id` on a remote backend. The README has the protocol.
 - `GET` discovery does not start a GPU and does not reset the idle timer.
 
 `/health` answers while every GPU is unloaded. With the model resident,

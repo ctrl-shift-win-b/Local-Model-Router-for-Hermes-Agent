@@ -22,6 +22,11 @@ htmlcov/
 router.local.json
 router.json
 config/router.json
+*.json.tmp
+
+# Directory state and the per-machine id. Both hold live addresses.
+members.json
+machine-id
 
 # Weights, secrets, and local environment.
 .env

@@ -1,0 +1,18 @@
+[Unit]
+Description=Router address directory
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Checkout used below. Change both lines if it lives elsewhere.
+# StateDirectory keeps members.json outside the repo.
+StateDirectory=router-registry
+ExecStart=/usr/bin/python3 %h/Local-Model-Router-for-Hermes-Agent/registry_server.py --listen 0.0.0.0:8096 --state %S/router-registry/members.json
+WorkingDirectory=%h/Local-Model-Router-for-Hermes-Agent
+Restart=on-failure
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

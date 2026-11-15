@@ -16,7 +16,7 @@ Clone this repository and use that checkout. `gpu_router.py` from this
 commit hashes to:
 
 ```text
-5da2ed8544f1033188489f3028d0a6616e212112d805a80df3abfadc5498dcb0
+0c3fd3ed3e5f2799b49daf8939a4c6fdeff4a00de027ffc585e904a3c137fec3
 ```
 
 Python 3.10 or newer is required. macOS system Python is too old. Point
@@ -27,7 +27,7 @@ Python 3.10 or newer is required. macOS system Python is too old. Point
 From the repo directory:
 
 ```bash
-python3 -m unittest test_gpu_router
+python3 -m unittest test_gpu_router test_registry_server
 ```
 
 The tests use in-process HTTP servers. They do not start a GPU.
@@ -53,6 +53,9 @@ Edit that copy. `examples/router.client.json` is the no-GPU shape:
   workstation is the sum of its text slots (2 + 1).
 - Replace `fast-gpu.example` and `workstation.example` with the real router
   URLs. Each of those machines listens on port `8092`.
+- `registry.server` is the address directory from the README. Set each
+  remote backend's `machine_id` to the `machine-id` file on that machine.
+  A backend with no `machine_id` stays on the origin in this file.
 
 `ninfer-router` reads, in order: `NINFER_ROUTER_CONFIG`, then
 `${XDG_CONFIG_HOME:-$HOME/.config}/ninfer-router/router.json`, then
@@ -392,14 +395,15 @@ Without this patch, a new client still routes, and every agent in one
 conversation shares one GPU.
 
 What the router does with the key is in the README. Short version: a new
-agent takes the fastest backend with a free in-flight slot. It stays while
+agent takes the fastest backend with a free agent slot. It stays while
 that card is up and every faster card is full. The next request moves when
 a faster card has a free slot. A request that is already streaming runs to
-completion. Slots count in-flight requests, not idle pins. Vision does not
-promote. A live pin still blocks unloading that GPU to make room for
-vision. Routers do not share pin tables. Each one probes peers about every
-2 seconds (`GET /v1/models` and `GET /health`) and treats a remote backend's
-occupancy as the max of its own forwards and the peer's `local_sessions`.
+completion. An assigned agent holds its slot between calls. A call in
+flight also takes a slot. Vision does not promote. A live pin still blocks
+unloading that GPU to make room for vision. Routers do not share pin
+tables. Each one probes peers about every 2 seconds (`GET /v1/models` and
+`GET /health`) and treats a remote backend's occupancy as the max of its
+own assigned agents, its own forwards, and the peer's `local_sessions`.
 A forwarded call sends `X-Router-Scope: local`, so the far router uses only
 its own backends.
 
@@ -440,9 +444,9 @@ curl -fsS http://127.0.0.1:8092/v1/models
 ```
 
 `/health` answers while every GPU is unloaded. `sessions` and
-`local_sessions` are in-flight text requests. `pins` is the idle preference
-count. A model id in `/v1/models` is the router's public id. It does not
-mean a GPU is loaded.
+`local_sessions` are in-flight text requests. `pins` is how many agents are
+assigned to that backend. A model id in `/v1/models` is the router's public
+id. It does not mean a GPU is loaded.
 
 Then open a new Hermes session and send a short text message. That `POST`
 is what loads a card. Vision is a message that contains an image or a

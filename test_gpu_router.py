@@ -23,6 +23,8 @@ from gpu_router import (
     Router,
     Supervisor,
     _forward_headers,
+    apply_member_origins,
+    load_machine_id,
     prepare_body,
     probe,
     request_kind,
@@ -703,9 +705,9 @@ class SessionPinTests(unittest.TestCase):
         worker.join(5)
         self.assertFalse(worker.is_alive())
         self.assertEqual(landed["alpha"]["ok"], "fast")
-        # The fast card is free again, so the agent that spilled promotes.
-        _status, promoted = _post(router, "/v1/chat/completions", body, {"X-Router-Session": "beta"})
-        self.assertEqual(promoted["ok"], "fast")
+        # Alpha still holds the only fast slot, so the agent that spilled stays.
+        _status, stayed_beta = _post(router, "/v1/chat/completions", body, {"X-Router-Session": "beta"})
+        self.assertEqual(stayed_beta["ok"], "next")
         _status, stayed = _post(
             router,
             "/v1/chat/completions",
@@ -714,7 +716,7 @@ class SessionPinTests(unittest.TestCase):
         )
         self.assertEqual(stayed["ok"], "fast")
         pins = {row["name"]: row["pins"] for row in router.health_document()["backends"]}
-        self.assertEqual(pins, {"5090": 2, "3090": 0})
+        self.assertEqual(pins, {"5090": 1, "3090": 1})
         self.assertEqual(router.health_document()["local_sessions"], 0)
 
     def test_a_dead_pin_moves_and_returns_when_the_faster_card_is_back(self) -> None:
@@ -760,9 +762,9 @@ class SessionPinTests(unittest.TestCase):
         router.probe_all()
         body = {"model": "qwen3.8-27b"}
         _post(router, "/v1/chat/completions", body, {"X-Router-Session": "alpha"})
-        # An idle pin does not reserve the fast card, so the next agent uses it too.
+        # Alpha holds the only fast slot, so the other session takes the next card.
         _status, beta = _post(router, "/v1/chat/completions", body, {"X-Hermes-Session-Id": "beta"})
-        self.assertEqual(beta["ok"], "fast")
+        self.assertEqual(beta["ok"], "next")
         _status, mixed = _post(
             router,
             "/v1/chat/completions",
@@ -878,15 +880,15 @@ class SessionPinTests(unittest.TestCase):
         self.assertTrue(held.pool.health_of("5090").up)
         self.assertEqual(held.pool.health_of("5090").sessions, 0)
         held.note("alpha", "text", "5090")
-        # A quiet pin is not occupancy. A live request on that card is.
-        self.assertEqual(held.place("text", False, "beta")[0].name, "5090")
-        claimed = held.claim(held.place("text", False, "alpha"), "text")
+        # Alpha's quiet pin holds the only fast slot. Alpha itself still fits.
+        self.assertEqual(held.place("text", False, "beta")[0].name, "3090")
+        claimed = held.claim(held.place("text", False, "alpha"), "text", "alpha")
         self.assertIsNotNone(claimed)
         assert claimed is not None
         self.assertEqual(claimed.name, "5090")
         self.assertEqual(held.place("text", False, "beta")[0].name, "3090")
         held.release_slot(claimed, "text")
-        self.assertEqual(held.place("text", False, "beta")[0].name, "5090")
+        self.assertEqual(held.place("text", False, "beta")[0].name, "3090")
 
     def test_a_slower_pin_promotes_only_while_the_faster_card_has_room(self) -> None:
         router = Router(
@@ -938,6 +940,144 @@ class SessionPinTests(unittest.TestCase):
         router.note("alpha", "vision", "5090")
         self.assertEqual(router.place("text", False, "beta")[0].name, "5090")
         self.assertEqual(router.health_document()["local_sessions"], 0)
+
+    def test_a_main_and_four_agents_spread_across_the_three_cards(self) -> None:
+        router = Router(
+            Pool(
+                [
+                    Backend("5090", "http://127.0.0.1:9", slots=2),
+                    Backend("3090", "http://127.0.0.1:9", slots=2),
+                    Backend("v100", "http://127.0.0.1:9", slots=1),
+                ]
+            ),
+            "qwen3.8-27b",
+            240000,
+            0.2,
+            1.0,
+        )
+        names = ("main", "a0", "a1", "a2", "a3")
+        landed = []
+        for name in names:
+            chosen = router.place("text", False, name)[0].name
+            landed.append(chosen)
+            router.note(name, "text", chosen)
+        self.assertEqual(landed, ["5090", "5090", "3090", "3090", "v100"])
+        again = [router.place("text", False, name)[0].name for name in names]
+        self.assertEqual(again, landed)
+
+    def test_a_directory_address_replaces_only_the_matching_backend(self) -> None:
+        pool = Pool(
+            [
+                Backend("5090", "https://10.0.0.1:8092", remote=True, machine_id="fast"),
+                Backend("3090", "http://127.0.0.1:8090"),
+            ]
+        )
+        held = pool.backends[0]
+        changed = apply_member_origins(
+            pool,
+            [
+                {"machine_id": "fast", "host": "10.0.0.2", "port": 8092},
+                {"machine_id": "other", "host": "10.0.0.3", "port": 1},
+            ],
+        )
+        self.assertEqual(changed, ["5090"])
+        self.assertEqual(pool.backends[0].origin, "https://10.0.0.2:8092")
+        self.assertEqual(pool.backends[1].origin, "http://127.0.0.1:8090")
+        self.assertEqual(held.origin, "https://10.0.0.1:8092")
+        self.assertEqual(
+            apply_member_origins(pool, [{"machine_id": "fast", "host": "10.0.0.2", "port": 8092}]),
+            [],
+        )
+        self.assertEqual(
+            apply_member_origins(
+                pool,
+                [{"machine_id": "fast", "host": "10.0.0.6", "port": 8092}],
+                lambda host, _port: host == "10.0.0.2",
+            ),
+            [],
+        )
+        self.assertEqual(pool.backends[0].origin, "https://10.0.0.2:8092")
+
+    def test_machine_id_is_created_once_and_a_bad_file_is_replaced(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            first = load_machine_id(state)
+            self.assertEqual(load_machine_id(state), first)
+            (state / "machine-id").write_text("has space\n", encoding="utf-8")
+            second = load_machine_id(state)
+            self.assertNotEqual(second, "has space")
+            self.assertEqual(load_machine_id(state), second)
+
+    def test_publish_registers_this_process_and_adopts_a_peer(self) -> None:
+        from http.server import BaseHTTPRequestHandler
+
+        from registry_server import Directory, make_handler
+
+        class Health(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                body = b'{"ok":true}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, fmt: str, *args) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as tmp:
+            answering = ThreadingHTTPServer(("127.0.0.1", 0), Health)
+            threading.Thread(target=answering.serve_forever, daemon=True).start()
+            peer_port = answering.server_address[1]
+            directory = Directory(Path(tmp) / "members.json", 300)
+            directory.register("peer", "fast", "127.0.0.1", peer_port, time.time())
+            server = ThreadingHTTPServer(
+                ("127.0.0.1", 0),
+                make_handler(directory, lambda _host, _port: False),
+            )
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            port = server.server_address[1]
+            pool = Pool(
+                [
+                    Backend("5090", "http://10.0.0.1:8092", remote=True, machine_id="peer"),
+                    Backend("3090", "http://127.0.0.1:8090"),
+                ]
+            )
+            router = Router(
+                pool,
+                "qwen3.8-27b",
+                240000,
+                0.2,
+                1.0,
+                registry_server=f"http://127.0.0.1:{port}",
+                machine_id="self-id",
+                machine_name="workstation",
+            )
+            try:
+                router.publish_registry(8092)
+            finally:
+                server.shutdown()
+                server.server_close()
+                answering.shutdown()
+                answering.server_close()
+            members = {row["machine_id"]: row for row in directory.members()}
+            self.assertEqual(members["self-id"]["host"], "127.0.0.1")
+            self.assertEqual(members["self-id"]["port"], 8092)
+            self.assertEqual(members["self-id"]["name"], "workstation")
+            self.assertEqual(pool.backends[0].origin, f"http://127.0.0.1:{peer_port}")
+            self.assertEqual(pool.backends[1].origin, "http://127.0.0.1:8090")
+
+    def test_publish_reports_a_closed_directory(self) -> None:
+        router = Router(
+            Pool([Backend("3090", "http://127.0.0.1:8090")]),
+            "qwen3.8-27b",
+            240000,
+            0.2,
+            1.0,
+            registry_server="http://127.0.0.1:1",
+            machine_id="self-id",
+        )
+        with self.assertRaises(OSError):
+            router.publish_registry(8092)
 
 
 def _serve_health(local_sessions: int, health_status: int) -> tuple[ThreadingHTTPServer, str]:

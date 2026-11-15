@@ -22,14 +22,22 @@ Cross-machine calls send ``X-Router-Scope: local``. The far router then uses
 only its own GPUs, so the two routers cannot bounce one request forever.
 
 A client names one agent with ``X-Router-Session``. Text placement is
-sticky until a faster card has a free in-flight slot: the agent stays put
-while its card is up and every faster card is busy, and the next request
-moves when a faster card is free. A running generation is not cancelled.
-``slots`` counts requests in flight (0 means unlimited), not idle agents, so
-a quiet pin does not block a free card. Vision keeps its pin. A request
-with no session header is not pinned. If the chosen backend fails the
-request, the key moves to whichever backend answers. Retiring a pin does
-not unload a process; the process idle timer still does.
+sticky until a faster card has a free agent slot: the agent stays put
+while its card is up and every faster card is full, and the next request
+moves when a faster card has room. A running generation is not cancelled.
+``slots`` is how many agents may keep that card (0 means unlimited). An
+assigned agent holds its slot between calls, so a main session and four
+delegates spread across the cards instead of all sitting on the fastest
+one. A call in flight also occupies a slot, which spreads a burst before
+those pins are recorded. The caller's own pin does not push that caller
+off its card. Vision keeps its pin and does not consume a text slot. A
+request with no session header is not pinned. If the chosen backend fails
+the request, the key moves to whichever backend answers. Retiring a pin
+does not unload a process; the process idle timer still does.
+
+When ``registry.server`` is set, this process tells that directory its
+machine id and listen port, then points any backend that carries the same
+machine id at the address the directory currently has.
 """
 
 from __future__ import annotations
@@ -38,15 +46,17 @@ import argparse
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, replace
 from http.client import HTTPConnection, HTTPException, HTTPSConnection, HTTPResponse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Callable, Iterable, Mapping
 from urllib.parse import urlsplit
 
 
@@ -79,6 +89,7 @@ _VISUAL_INPUTS = {
     "input_video",
 }
 _WEIGHTS_MISSING = "weights are not installed"
+_MACHINE_ID_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
 
 
 class RouterError(Exception):
@@ -111,6 +122,7 @@ class Backend:
     gpu: str | None = None
     weakness: int = 0
     slots: int = 0
+    machine_id: str = ""
 
     @property
     def managed(self) -> bool:
@@ -180,6 +192,14 @@ class Pool:
                 if health.up or health.error == "unchecked" or backend.managed:
                     chosen.append(backend)
             return chosen
+
+    def replace_origin(self, name: str, origin: str) -> None:
+        """Point one backend at a new address. In-flight calls keep the old object."""
+        with self._lock:
+            self.backends = tuple(
+                replace(backend, origin=origin) if backend.name == name else backend
+                for backend in self.backends
+            )
 
     def models_of(self, name: str) -> tuple[str, ...]:
         with self._lock:
@@ -761,9 +781,9 @@ class Affinity:
 
     A pin retires after ``idle_seconds`` with no successful request for that
     key and kind. Zero disables retirement. Text and vision pins are separate,
-    so a vision call does not consume a text slot. In-flight counts are
-    separate from pins: a quiet agent keeps its preference and does not occupy
-    a concurrency slot.
+    so a vision call does not consume a text slot. A text pin holds one slot
+    on its card until it retires. In-flight counts cover calls that do not
+    have a pin yet.
     """
 
     def __init__(self, idle_seconds: float) -> None:
@@ -816,6 +836,44 @@ class Affinity:
                 if kind == "text" and name in names
             )
 
+    def load(self, backend: str, kind: str, session: str | None, remote_sessions: int = 0) -> int:
+        """Slots taken on ``backend`` from this session's point of view.
+
+        Other text agents assigned here count. This session's own pin does
+        not, so a full card still serves the agents that already own it.
+        Calls in flight count too, including ones not pinned yet. A remote
+        peer's in-flight count counts when it is higher.
+        """
+        with self._lock:
+            return self._load_unlocked(backend, kind, session, remote_sessions)
+
+    def try_reserve(
+        self,
+        backend: str,
+        kind: str,
+        session: str | None,
+        slots: int,
+        remote_sessions: int,
+    ) -> bool:
+        """Take one in-flight slot when the card has room. ``slots`` <= 0 always takes one."""
+        with self._lock:
+            if slots > 0 and self._load_unlocked(backend, kind, session, remote_sessions) >= slots:
+                return False
+            key = (backend, kind)
+            self._inflight[key] = self._inflight.get(key, 0) + 1
+            return True
+
+    def _load_unlocked(self, backend: str, kind: str, session: str | None, remote_sessions: int) -> int:
+        inflight = self._inflight.get((backend, kind), 0)
+        if kind != "text":
+            return inflight if inflight > remote_sessions else remote_sessions
+        pins = sum(
+            1
+            for (pin_session, pin_kind), (name, _used) in self._pins.items()
+            if pin_kind == kind and name == backend and pin_session != session
+        )
+        return max(pins, inflight, remote_sessions)
+
     def inflight(self, backend: str, kind: str) -> int:
         with self._lock:
             return self._inflight.get((backend, kind), 0)
@@ -843,6 +901,82 @@ class Affinity:
                 self._inflight[key] = current - 1
 
 
+def load_machine_id(state_dir: Path) -> str:
+    """Stable id for this router. Created once, then reused across address changes."""
+    path = state_dir / "machine-id"
+    try:
+        existing = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        existing = ""
+    if 1 <= len(existing) <= 80 and set(existing) <= _MACHINE_ID_CHARS:
+        return existing
+    path.parent.mkdir(parents=True, exist_ok=True)
+    created = str(uuid.uuid4())
+    path.write_text(created + "\n", encoding="utf-8")
+    return created
+
+
+def endpoint_answers(host: str, port: int, timeout: float = 1.0) -> bool:
+    """True when that address answers GET /health. A refused port stays put."""
+    connection = HTTPConnection(host, port, timeout=timeout)
+    try:
+        connection.request("GET", "/health")
+        response = connection.getresponse()
+        response.read()
+        return response.status == 200
+    except OSError:
+        return False
+    finally:
+        connection.close()
+
+
+def apply_member_origins(
+    pool: Pool,
+    members: Iterable[Mapping],
+    reachable: Callable[[str, int], bool] | None = None,
+) -> list[str]:
+    """Move backends onto the directory address for their machine id.
+
+    A backend with no machine id is left on the address in the config. An
+    address that does not answer is left unused, so a rewritten source
+    cannot pull a router onto a gateway. The names returned are the ones
+    whose origin changed.
+    """
+    by_id: dict[str, Mapping] = {}
+    for member in members:
+        if not isinstance(member, Mapping):
+            continue
+        machine_id = str(member.get("machine_id") or "")
+        if machine_id:
+            by_id[machine_id] = member
+    changed: list[str] = []
+    for backend in pool.backends:
+        member = by_id.get(backend.machine_id)
+        if member is None:
+            continue
+        host = str(member.get("host") or "")
+        try:
+            port = int(member.get("port") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not host or port <= 0:
+            continue
+        if reachable is not None:
+            try:
+                answered = bool(reachable(host, port))
+            except Exception:
+                answered = False
+            if not answered:
+                continue
+        scheme, old_host, old_port = backend.split()
+        if old_host == host and old_port == port:
+            continue
+        shown = f"[{host}]" if ":" in host and not host.startswith("[") else host
+        pool.replace_origin(backend.name, f"{scheme}://{shown}:{port}")
+        changed.append(backend.name)
+    return changed
+
+
 class Router:
     def __init__(
         self,
@@ -855,6 +989,10 @@ class Router:
         *,
         idle_seconds: float = 600.0,
         affinity: Affinity | None = None,
+        registry_server: str = "",
+        registry_interval: float = 30.0,
+        machine_id: str = "",
+        machine_name: str = "",
     ) -> None:
         self.pool = pool
         self.public_model = public_model
@@ -863,8 +1001,53 @@ class Router:
         self.request_timeout = request_timeout
         self.supervisor = supervisor
         self.affinity = affinity if affinity is not None else Affinity(idle_seconds)
+        self.registry_server = registry_server.rstrip("/")
+        self.registry_interval = registry_interval
+        self.machine_id = machine_id
+        self.machine_name = machine_name or "router"
         if supervisor is not None:
             supervisor.set_pin_check(self.affinity.pinned)
+
+    def publish_registry(self, listen_port: int) -> None:
+        """Register this process and adopt any new peer addresses. Errors stay in the log."""
+        if not self.registry_server or not self.machine_id:
+            return
+        parts = urlsplit(self.registry_server)
+        if parts.scheme not in {"http", "https"} or not parts.hostname:
+            return
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        # The listen address is the local side of this connection. A path
+        # that rewrites the source still leaves this side on the real NIC.
+        discovery = socket.create_connection((parts.hostname, port), timeout=2.0)
+        listen_host = discovery.getsockname()[0]
+        discovery.close()
+        body = json.dumps(
+            {
+                "machine_id": self.machine_id,
+                "name": self.machine_name,
+                "port": listen_port,
+                "listen_host": listen_host,
+            }
+        ).encode("utf-8")
+        connection_cls = HTTPSConnection if parts.scheme == "https" else HTTPConnection
+        connection = connection_cls(parts.hostname, port, timeout=2.0)
+        try:
+            connection.request(
+                "POST",
+                "/registry/register",
+                body=body,
+                headers={"Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            payload = response.read()
+        finally:
+            connection.close()
+        if response.status != 200:
+            raise OSError(f"registry HTTP {response.status}")
+        data = json.loads(payload.decode("utf-8"))
+        members = data.get("members") if isinstance(data, dict) else None
+        if isinstance(members, list):
+            apply_member_origins(self.pool, members, endpoint_answers)
 
     def probe_all(self) -> None:
         for backend, _health in self.pool.snapshot():
@@ -889,24 +1072,19 @@ class Router:
 
         return sorted(rows, key=key)
 
-    def _occupied(self, backend: Backend, kind: str) -> int:
-        local = self.affinity.inflight(backend.name, kind)
-        if not backend.remote:
-            return local
-        reported = self.pool.health_of(backend.name).sessions
-        return local if local > reported else reported
-
-    def _free(self, backend: Backend, kind: str) -> bool:
+    def _free(self, backend: Backend, kind: str, session: str | None = None) -> bool:
         if backend.slots <= 0:
             return True
-        return self._occupied(backend, kind) < backend.slots
+        remote = self.pool.health_of(backend.name).sessions if backend.remote else 0
+        return self.affinity.load(backend.name, kind, session, remote) < backend.slots
 
     def place(self, kind: str, local_only: bool, session: str | None) -> list[Backend]:
         """Order backends for one request.
 
-        Text is sticky until a faster candidate has a free in-flight slot.
-        Config order is the speed order, fastest first. An idle pin does not
-        consume a slot. Vision does not promote: a vision pin stays first.
+        Text is sticky until a faster candidate has a free agent slot.
+        Config order is the speed order, fastest first. An assigned agent
+        holds its slot while the pin lives, so idle agents do not pile onto
+        the fastest card. Vision does not promote: a vision pin stays first.
         No session key is not pinned; a text request still prefers a card
         that has room. The caller records a pin only after a session key
         is actually served.
@@ -925,40 +1103,42 @@ class Router:
                         return [backend, *[item for item in rows if item.name != pinned]]
             return rows
         if not session:
-            free = [backend for backend in rows if self._free(backend, kind)]
+            free = [backend for backend in rows if self._free(backend, kind, None)]
             busy = [backend for backend in rows if backend not in free]
             return free + busy
         pinned_name = self.affinity.get(session, kind)
         chosen: Backend | None = None
         if pinned_name:
             # Walk fastest-first. A free card before the pin is a promotion.
-            # Reaching the pin means nothing faster was free.
+            # Reaching the pin means nothing faster was free. The caller's
+            # own pin still counts as room on that card.
             for backend in rows:
                 if backend.name == pinned_name:
-                    if self._free(backend, kind):
+                    if self._free(backend, kind, session):
                         chosen = backend
                     break
-                if self._free(backend, kind):
+                if self._free(backend, kind, session):
                     chosen = backend
                     break
         if chosen is None:
             for backend in rows:
-                if self._free(backend, kind):
+                if self._free(backend, kind, session):
                     chosen = backend
                     break
         if chosen is None:
             chosen = rows[0]
         rest = [backend for backend in rows if backend.name != chosen.name]
-        free_rest = [backend for backend in rest if self._free(backend, kind)]
+        free_rest = [backend for backend in rest if self._free(backend, kind, session)]
         busy_rest = [backend for backend in rest if backend not in free_rest]
         return [chosen, *free_rest, *busy_rest]
 
-    def claim(self, candidates: list[Backend], kind: str) -> Backend | None:
+    def claim(self, candidates: list[Backend], kind: str, session: str | None = None) -> Backend | None:
         """Reserve one in-flight slot, preferring the first candidate with room.
 
-        Every candidate being full still reserves the first one, so a healthy
-        engine can queue inside its own concurrency limit. The caller releases
-        the reservation when the response finishes, including on failover.
+        Room follows the same agent-slot count as placement. Every candidate
+        being full still reserves the first one, so a healthy engine can queue
+        inside its own concurrency limit. The caller releases the reservation
+        when the response finishes, including on failover.
         """
         if not candidates:
             return None
@@ -967,24 +1147,18 @@ class Router:
             for backend in candidates
             if backend.remote
         }
-        with self.affinity._lock:
-            def used(backend: Backend) -> int:
-                local = self.affinity._inflight.get((backend.name, kind), 0)
-                if not backend.remote:
-                    return local
-                remote = reported.get(backend.name, 0)
-                return local if local > remote else remote
-
-            pick = None
-            for backend in candidates:
-                if backend.slots <= 0 or used(backend) < backend.slots:
-                    pick = backend
-                    break
-            if pick is None:
-                pick = candidates[0]
-            key = (pick.name, kind)
-            self.affinity._inflight[key] = self.affinity._inflight.get(key, 0) + 1
-            return pick
+        for backend in candidates:
+            if self.affinity.try_reserve(
+                backend.name,
+                kind,
+                session,
+                backend.slots,
+                reported.get(backend.name, 0),
+            ):
+                return backend
+        first = candidates[0]
+        self.affinity.acquire(first.name, kind)
+        return first
 
     def release_slot(self, backend: Backend, kind: str) -> None:
         self.affinity.release(backend.name, kind)
@@ -1256,7 +1430,7 @@ class RouterHandler(BaseHTTPRequestHandler):
         # which is the whole generation for a streaming body.
         remaining = list(candidates)
         while remaining:
-            backend = self.router.claim(remaining, kind)
+            backend = self.router.claim(remaining, kind, session)
             if backend is None:
                 break
             remaining = [item for item in remaining if item.name != backend.name]
@@ -1354,6 +1528,7 @@ def _backend_from_json(row: dict) -> Backend:
         gpu=row.get("gpu"),
         weakness=int(row.get("weakness", 0)),
         slots=int(row.get("slots", 0)),
+        machine_id=str(row.get("machine_id") or ""),
     )
 
 
@@ -1395,6 +1570,8 @@ def router_from_args(args: argparse.Namespace) -> tuple[Router, str, int, float]
     probe_timeout = args.probe_timeout
     probe_interval = args.probe_interval
     request_timeout = args.request_timeout
+    registry_server = ""
+    registry_interval = 30.0
     if args.config:
         data = load_router_config(Path(args.config))
         backends = tuple(_backend_from_json(row) for row in data["backends"])
@@ -1409,6 +1586,10 @@ def router_from_args(args: argparse.Namespace) -> tuple[Router, str, int, float]
         fail_cooldown = float(data.get("fail_cooldown", fail_cooldown))
         if not state_text:
             state_text = str(data.get("state_dir", ""))
+        registry = data.get("registry") or {}
+        if isinstance(registry, dict):
+            registry_server = str(registry.get("server") or "")
+            registry_interval = float(registry.get("interval_seconds", registry_interval))
     else:
         if not args.backend:
             raise SystemExit("pass --config or at least one --backend name=url")
@@ -1430,6 +1611,10 @@ def router_from_args(args: argparse.Namespace) -> tuple[Router, str, int, float]
         request_timeout,
         supervisor,
         idle_seconds=idle_seconds,
+        registry_server=registry_server,
+        registry_interval=registry_interval,
+        machine_id=load_machine_id(state_dir) if registry_server else "",
+        machine_name=socket.gethostname().split(".")[0],
     )
     host, separator, port_text = listen.rpartition(":")
     if not separator:
@@ -1461,8 +1646,18 @@ def serve(router: Router, host: str, port: int, probe_interval: float) -> None:
                     sys.stderr.write(f"idle reap: {exc}\n")
             stop.wait(1.0)
 
+    def registry_loop() -> None:
+        while not stop.is_set():
+            try:
+                router.publish_registry(port)
+            except Exception as exc:
+                sys.stderr.write(f"registry: {exc}\n")
+            stop.wait(router.registry_interval)
+
     threading.Thread(target=probe_loop, name="gpu-router-probe", daemon=True).start()
     threading.Thread(target=idle_loop, name="gpu-router-idle", daemon=True).start()
+    if router.registry_server:
+        threading.Thread(target=registry_loop, name="gpu-router-registry", daemon=True).start()
     router.probe_all()
 
     class BoundHandler(RouterHandler):
